@@ -57,28 +57,105 @@
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
+  function adjacentWords(text, start, end) {
+    const leftMatch  = text.slice(0, start).match(/(\w+)\W*$/);
+    const rightMatch = text.slice(end).match(/^\W*(\w+)/);
+    return {
+      left:  leftMatch  ? leftMatch[1]  : null,
+      right: rightMatch ? rightMatch[1] : null,
+    };
+  }
+
+  // ── Inflection matching ────────────────────────────────────────────────────
+  // Datamuse returns base/lemma forms. If the original word is an inflected
+  // form (-s, -es, -ed, -ing), re-inflect synonyms to match.
+
+  function inflect(synonym, original) {
+    const orig = original.toLowerCase();
+    const syn  = synonym.toLowerCase();
+    if (syn.endsWith('ing') || syn.endsWith('ed')) return synonym; // already inflected
+
+    // -ing  (matching, running)
+    if (orig.endsWith('ing')) {
+      if (syn.endsWith('e')) return syn.slice(0, -1) + 'ing'; // make → making
+      return syn + 'ing';
+    }
+    // -ed  (matched, walked)
+    if (orig.endsWith('ed')) {
+      if (syn.endsWith('e')) return syn + 'd';   // love → loved
+      return syn + 'ed';
+    }
+    // -es  (matches, catches) — must check before -s
+    if (orig.endsWith('es') && !syn.endsWith('s')) {
+      return /(?:ch|sh|[xzs])$/.test(syn) ? syn + 'es' : syn + 's';
+    }
+    // -s  (runs, plays)
+    if (orig.endsWith('s') && !orig.endsWith('ss') && !syn.endsWith('s')) {
+      return /(?:ch|sh|[xzs])$/.test(syn) ? syn + 'es' : syn + 's';
+    }
+    return synonym;
+  }
+
   // ── Datamuse API ───────────────────────────────────────────────────────────
 
-  async function fetchSynonyms(word) {
+  async function fetchSynonyms(word, { left, right } = {}) {
     const bare = word.toLowerCase().replace(/[^a-z'-]/g, '');
     if (!bare) return [];
+    const enc = encodeURIComponent(bare);
+    const ctx = [
+      left  ? `&lc=${encodeURIComponent(left.toLowerCase())}`  : '',
+      right ? `&rc=${encodeURIComponent(right.toLowerCase())}` : '',
+    ].join('');
+    const CORE_POS = ['n', 'v', 'adj', 'adv'];
     try {
-      const res = await fetch(
-        `https://api.datamuse.com/words?rel_syn=${encodeURIComponent(bare)}&max=30`
-      );
-      if (!res.ok) return [];
-      const data = await res.json();
-      if (!data.length) return [];
+      const [synRes, mlRes, posRes] = await Promise.all([
+        fetch(`https://api.datamuse.com/words?rel_syn=${enc}${ctx}&max=30&md=p`),
+        fetch(`https://api.datamuse.com/words?ml=${enc}${ctx}&max=30&md=p`),
+        fetch(`https://api.datamuse.com/words?sp=${enc}&md=p&max=1`),
+      ]);
+
+      const parse = async (res) => res.ok ? res.json() : [];
+      const [synData, mlData, posData] = await Promise.all([parse(synRes), parse(mlRes), parse(posRes)]);
+
+      // POS tags for the original word (n / v / adj / adv)
+      const originalPos = (posData[0]?.tags ?? []).filter(t => CORE_POS.includes(t));
+
+      // Narrow POS using grammatical context clues so ambiguous words like
+      // "test" (n or v) resolve correctly — e.g. "to test" must be a verb.
+      const DET = new Set(['a','an','the','my','your','his','her','its','our','their','this','that','these','those']);
+      const l = left?.toLowerCase();
+      let effectivePos = originalPos;
+      if (originalPos.length > 1) {
+        if (l === 'to' && originalPos.includes('v'))        effectivePos = ['v'];
+        else if (DET.has(l) && originalPos.includes('n'))   effectivePos = ['n', 'adj'];
+      }
+
+      // Merge: for duplicates keep the higher score
+      const seen = new Map();
+      for (const d of [...synData, ...mlData]) {
+        const existing = seen.get(d.word);
+        if (!existing || d.score > existing.score) seen.set(d.word, d);
+      }
+
+      if (!seen.size) return [];
 
       const isMultiWord = bare.includes(' ');
-      const topScore = data[0].score || 1;
-      const threshold = topScore * 0.2;
+      const allResults = [...seen.values()].sort((a, b) => b.score - a.score);
+      const topScore = allResults[0].score || 1;
+      const threshold = topScore * 0.15;
 
-      return data
+      return allResults
         .filter(d => d.score >= threshold)
-        .filter(d => isMultiWord || !d.word.includes(' '))  // match single/multi word style
-        .map(d => d.word)
-        .slice(0, 20);
+        .filter(d => isMultiWord || !d.word.includes(' '))
+        .filter(d => {
+          if (!effectivePos.length) return true; // unknown POS — don't filter
+          const resultPos = (d.tags ?? []).filter(t => CORE_POS.includes(t));
+          if (!resultPos.length) return true;    // result has no POS tag — keep
+          return resultPos.some(t => effectivePos.includes(t));
+        })
+        .map(d => inflect(d.word, bare))
+        .filter(w => w !== bare)
+        .slice(0, 25);
     } catch (err) {
       console.warn('[SynonymRing] fetch failed:', err);
       return [];
@@ -94,7 +171,7 @@
     while (start > 0 && /\w/.test(text[start - 1])) start--;
     while (end < text.length && /\w/.test(text[end])) end++;
     if (start === end) return null;
-    return { start, end, word: text.slice(start, end) };
+    return { start, end, word: text.slice(start, end), ...adjacentWords(text, start, end) };
   }
 
   function wordBoundsAtPoint(x, y) {
@@ -136,7 +213,10 @@
       sel.addRange(trimmed);
     }
 
-    return { node: startNode, start: range.startOffset, end: range.startOffset + word.length, word };
+    const nodeText = startNode.textContent;
+    const wordStart = range.startOffset;
+    return { node: startNode, start: wordStart, end: wordStart + word.length, word,
+             ...adjacentWords(nodeText, wordStart, wordStart + word.length) };
   }
 
   // ── DOM replacement ────────────────────────────────────────────────────────
@@ -145,7 +225,17 @@
     const el = ring.element;
     const start = ring.wordStart;
     const text = el.value;
-    el.value = text.slice(0, start) + newWord + text.slice(start + ring._currentLen);
+    const newValue = text.slice(0, start) + newWord + text.slice(start + ring._currentLen);
+
+    // Use the native value setter so React-controlled inputs pick up the change.
+    const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    if (nativeSetter) {
+      nativeSetter.call(el, newValue);
+    } else {
+      el.value = newValue;
+    }
+
     el.selectionStart = start;
     el.selectionEnd = start + newWord.length;
     ring._currentLen = newWord.length;
@@ -153,32 +243,61 @@
   }
 
   function replaceInContentEditable(newWord) {
-    ring.element.focus();
+    // Focus the contenteditable root, not an arbitrary child element (e.target
+    // during long-press can be a nested <span>, <b>, etc.).
+    const editableRoot = ring.element.closest('[contenteditable="true"]') ?? ring.element;
+    editableRoot.focus();
+
     const sel = window.getSelection();
     if (!sel) return;
 
-    // Works for both first call (cursor somewhere in word from long-press)
-    // and subsequent calls (cursor at end of last inserted word from execCommand).
-    // In both cases: jump to word start, extend to word end, then trim any
-    // trailing non-word chars Chrome includes — all via sel.modify so the
-    // browser uses the same word boundaries as execCommand, avoiding off-by-one.
-    sel.modify('move', 'backward', 'word');
-    sel.modify('extend', 'forward', 'word');
-
-    const raw = sel.toString();
-    const match = raw.match(/^[\w'-]+/);
-    if (!match) return;
-
-    // Trim trailing non-word chars using the same movement API (no range arithmetic)
-    const extra = raw.length - match[0].length;
-    for (let i = 0; i < extra; i++) {
-      sel.modify('extend', 'backward', 'character');
+    if (!ring.textNode?.isConnected) {
+      console.warn('[SynonymRing] textNode is stale — cannot replace');
+      return;
     }
 
-    if (!sel.toString()) return;
-    document.execCommand('insertText', false, newWord);
-    ring.element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: newWord }));
+    try {
+      const range = document.createRange();
+      range.setStart(ring.textNode, ring.nodeStart);
+      range.setEnd(ring.textNode, ring.nodeStart + ring._currentLen);
+      sel.removeAllRanges();
+      sel.addRange(range);
+    } catch (e) {
+      console.warn('[SynonymRing] range creation failed:', e);
+      return;
+    }
+
+    const cmdOk = document.execCommand('insertText', false, newWord);
+
+    // execCommand often splits text nodes. Re-anchor from the updated cursor
+    // position so future replacements use the correct node/offset.
+    if (sel.rangeCount > 0) {
+      const cur = sel.getRangeAt(0);
+      if (cur.startContainer.nodeType === Node.TEXT_NODE) {
+        ring.textNode = cur.startContainer;
+        ring.nodeStart = cur.startOffset - newWord.length;
+      }
+    }
+
+    if (!cmdOk && ring.textNode?.isConnected) {
+      // execCommand failed — try direct write. This won't work in React-based
+      // editors but is a best-effort fallback for simpler contenteditable fields.
+      ring.textNode.textContent =
+        ring.textNode.textContent.slice(0, ring.nodeStart) + newWord +
+        ring.textNode.textContent.slice(ring.nodeStart + ring._currentLen);
+    }
+
     ring._currentLen = newWord.length;
+
+    try {
+      const cur = document.createRange();
+      cur.setStart(ring.textNode, ring.nodeStart + newWord.length);
+      cur.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(cur);
+    } catch (_) {}
+
+    editableRoot.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: newWord }));
   }
 
   // ── Widget ─────────────────────────────────────────────────────────────────
@@ -213,6 +332,7 @@
 
     const slideClass = direction ? `sr-slide-${direction}` : '';
     widget.innerHTML = `
+      <div class="sr-original">${escapeHtml(ring.original)}</div>
       <div class="sr-adj sr-adj-up">
         <span class="sr-chevron">▲</span>
         <span class="sr-neighbor">${escapeHtml(prevWord)}</span>
@@ -334,7 +454,7 @@
 
     const token = {};
     pendingFetch = token;
-    const synonyms = await fetchSynonyms(bounds.word);
+    const synonyms = await fetchSynonyms(bounds.word, { left: bounds.left, right: bounds.right });
     if (pendingFetch !== token) return;
     pendingFetch = null;
 
@@ -498,6 +618,7 @@
       exitRing(true);
     } else if (e.key === 'Enter') {
       blockEvent(e);
+      applyWord();
       exitRing(false);
     } else {
       // Block everything else while ring is active
