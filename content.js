@@ -242,62 +242,61 @@
     el.dispatchEvent(new Event('input', { bubbles: true }));
   }
 
+  // Walk up to the actual [contenteditable] root. el.contentEditable returns
+  // 'true' for contenteditable="true", contenteditable="", and bare contenteditable.
+  // CSS [contenteditable="true"] only matches the first form, so we use JS.
+  function findEditableRoot(el) {
+    let node = el;
+    while (node) {
+      if (node.contentEditable === 'true') return node;
+      node = node.parentElement;
+    }
+    return el;
+  }
+
   function replaceInContentEditable(newWord) {
-    // Focus the contenteditable root, not an arbitrary child element (e.target
-    // during long-press can be a nested <span>, <b>, etc.).
-    const editableRoot = ring.element.closest('[contenteditable="true"]') ?? ring.element;
+    const editableRoot = findEditableRoot(ring.element);
     editableRoot.focus();
 
     const sel = window.getSelection();
     if (!sel) return;
 
-    if (!ring.textNode?.isConnected) {
-      console.warn('[SynonymRing] textNode is stale — cannot replace');
-      return;
+    // If there is no live selection (e.g. focus was lost), try to restore the
+    // cursor to the end of the current word using the stored text-node anchor.
+    if (!sel.rangeCount && ring.textNode?.isConnected) {
+      try {
+        const r = document.createRange();
+        r.setStart(ring.textNode, ring.nodeStart + ring._currentLen);
+        r.collapse(true);
+        sel.addRange(r);
+      } catch (_) { return; }
     }
+    if (!sel.rangeCount) return;
 
-    try {
-      const range = document.createRange();
-      range.setStart(ring.textNode, ring.nodeStart);
-      range.setEnd(ring.textNode, ring.nodeStart + ring._currentLen);
-      sel.removeAllRanges();
-      sel.addRange(range);
-    } catch (e) {
-      console.warn('[SynonymRing] range creation failed:', e);
-      return;
-    }
+    // Collapse to the END of the selection so that 'backward word' reliably
+    // moves to the start of the current word regardless of whether the selection
+    // is collapsed (subsequent calls) or spans the word (first call).
+    const r = sel.getRangeAt(0);
+    sel.collapse(r.endContainer, r.endOffset);
 
-    const cmdOk = document.execCommand('insertText', false, newWord);
+    sel.modify('move', 'backward', 'word');
+    sel.modify('extend', 'forward',  'word');
 
-    // execCommand often splits text nodes. Re-anchor from the updated cursor
-    // position so future replacements use the correct node/offset.
-    if (sel.rangeCount > 0) {
-      const cur = sel.getRangeAt(0);
-      if (cur.startContainer.nodeType === Node.TEXT_NODE) {
-        ring.textNode = cur.startContainer;
-        ring.nodeStart = cur.startOffset - newWord.length;
+    // Chrome's 'forward word' overshoots to include trailing whitespace; trim.
+    const raw = sel.toString();
+    const match = raw.match(/^[\w'-]+/);
+    if (!match) return;
+    if (raw.length > match[0].length) {
+      for (let i = 0; i < raw.length - match[0].length; i++) {
+        sel.modify('extend', 'backward', 'character');
       }
     }
 
-    if (!cmdOk && ring.textNode?.isConnected) {
-      // execCommand failed — try direct write. This won't work in React-based
-      // editors but is a best-effort fallback for simpler contenteditable fields.
-      ring.textNode.textContent =
-        ring.textNode.textContent.slice(0, ring.nodeStart) + newWord +
-        ring.textNode.textContent.slice(ring.nodeStart + ring._currentLen);
-    }
-
+    document.execCommand('insertText', false, newWord);
     ring._currentLen = newWord.length;
-
-    try {
-      const cur = document.createRange();
-      cur.setStart(ring.textNode, ring.nodeStart + newWord.length);
-      cur.collapse(true);
-      sel.removeAllRanges();
-      sel.addRange(cur);
-    } catch (_) {}
-
-    editableRoot.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: newWord }));
+    editableRoot.dispatchEvent(new InputEvent('input', {
+      bubbles: true, inputType: 'insertText', data: newWord,
+    }));
   }
 
   // ── Widget ─────────────────────────────────────────────────────────────────
